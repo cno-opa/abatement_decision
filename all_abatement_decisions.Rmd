@@ -1,0 +1,277 @@
+---
+title: 'Abatement Decision Tool: Sale versus Demolition'
+output:
+  html_notebook: default
+  html_document: default
+---
+
+
+
+```{r}
+
+library(caret)
+library(feather)
+library(forcats)
+library(gbm)
+library(lime)
+library(modelr)
+library(stringr)
+library(tidyverse)
+
+raw <- read_feather("./data/all_decisions.feather")
+
+decisions <- raw %>% 
+  filter(is_this_a_vacant_lot != 'YES',
+         occupancy_use != 'Vacant Lot',
+         !is.na(mva_value)) %>% 
+  select(-c(code_enforcement_district, council_district, fire_district, is_this_a_vacant_lot)) %>% 
+  rename(contribute_streetscape = does_the_structure_contribute_to_the_neighborhood_or_streetscape,
+         block_blight = characterize_the_amount_of_blight_on_the_same_block,
+         historic_district = in_national_historic_district,
+         conservation_district = in_neighborhood_conservation_district,
+         market_subjective = please_characterize_the_relative_strength_of_the_real_estate_mkt) %>% 
+  mutate(block_blight = fct_relevel(block_blight, 'High', 'Medium', 'Low'),
+         exterior_condition = fct_relevel(exterior_condition, 'Good', 'Fair', 'Poor', 'Very Poor'),
+         foundation_condition = fct_relevel(foundation_condition, 'Good', 'Fair', 'Poor', 'Very Poor'),
+         roof_condition = fct_relevel(roof_condition, 'Good', 'Fair', 'Poor', 'Very Poor'))
+  
+
+# Preprocessing -----------------------------------------------------------
+
+num_col_indices <- map_lgl(decisions, is.numeric)
+fact_col_inds <- 8:ncol(decisions)
+
+fact_cols <- map(decisions[,fact_col_inds], factor) %>% 
+  as_tibble()
+
+fact_cols$mva_value <- fct_collapse(fact_cols$mva_value,
+                                    high = c('A', 'B', 'C'),
+                                    medium = c('D', 'E', 'F'),
+                                    low = c('G', 'H'))
+
+fact_cols$occupancy_use <- fct_collapse(fact_cols$occupancy_use,
+                                    residential = c('Residential'),
+                                    commercial = c('Commercial', 'Mixed Use'))
+
+map(fact_cols, ~table(.)/length(.))
+
+na_percs <- map_dbl(fact_cols, ~sum(is.na(.)/length(.)))
+na_percs_logical <- na_percs < 0.05
+
+num_levels <- map_int(fact_cols, ~length(levels(.)))
+num_levels_logical <- num_levels <= 4
+
+perc_greatest <- map(fact_cols, ~max(table(.)/length(.)))
+perc_greatest_logical <- perc_greatest < 0.95
+
+fact_cols <- fact_cols[, na_percs_logical & num_levels_logical & perc_greatest_logical]
+complete_indices_fact <- complete.cases(fact_cols)
+
+# diagnose problems with categorical variables
+
+# rejoin numeric variables
+
+num_cols <- decisions[complete_indices_fact, num_col_indices]
+fact_cols <- fact_cols[complete_indices_fact,]
+
+with_cats <- bind_cols(decisions['outcome'][complete_indices_fact,], num_cols, fact_cols)
+
+# process numeric variables
+
+mod_dat <- with_cats[complete.cases(with_cats),] %>% 
+  mutate(outcome = factor(outcome))
+
+
+
+```
+
+
+
+
+
+```{r scatterplots}
+
+featurePlot(x = mod_dat[, 2:7], 
+            y = factor(mod_dat$outcome),
+            plot = "pairs",
+            auto.key = list(columns = 2))
+
+```
+
+```{r box_plots}
+
+featurePlot(x = mod_dat[, 2:7], 
+            y = factor(mod_dat$outcome), 
+            plot = "box",
+            scales = list(y = list(relation = "free"),
+                          x = list(rot = 90)),
+            layout = c(6, 1),
+            auto.key = list(columns = 2))
+
+```
+
+```{r boxplots_by_category}
+
+mod_dat %>% 
+  ggplot(aes(x = block_blight, fill = outcome)) +
+  geom_bar(position = 'fill')
+
+mod_dat %>% 
+  ggplot(aes(x = contribute_streetscape, fill = outcome)) +
+  geom_bar(position = 'fill')
+
+mod_dat %>% 
+  ggplot(aes(x = exterior_condition, fill = outcome)) +
+  geom_bar(position = 'fill')
+mod_dat %>% 
+  ggplot(aes(x = foundation_condition, fill = outcome)) +
+  geom_bar(position = 'fill')
+
+mod_dat %>% 
+  ggplot(aes(x = roof_condition, fill = outcome)) +
+  geom_bar(position = 'fill')
+
+mod_dat %>% 
+  ggplot(aes(x = historic_district, fill = outcome)) +
+  geom_bar(position = 'fill')
+
+mod_dat %>% 
+  ggplot(aes(x = conservation_district, fill = outcome)) +
+  geom_bar(position = 'fill')
+
+mod_dat %>% 
+  ggplot(aes(x = mva_value, fill = outcome)) +
+  geom_bar(position = 'fill')
+
+```
+
+```{r}
+
+# # mod_dat <- mod_dat %>%
+# #   select(-violations)
+# 
+set.seed(1)
+
+in_train <- createDataPartition(mod_dat$outcome, list = FALSE, p = 0.75)
+
+training <- mod_dat[in_train,]
+testing <- mod_dat[-in_train,]
+
+# Impute missing numeric values
+# pp <- preProcess(training, method = c("range"))
+# 
+# training <- predict(pp, training)
+# testing <- predict(pp, testing)
+
+train_control <- trainControl(method = "repeatedcv",
+                              summaryFunction = twoClassSummary,
+                              classProbs = TRUE,
+                              number = 4,
+                              repeats = 4)
+
+```
+
+```{r glmnet}
+
+# Train model using cross-validation
+fit_glm <- train(form = outcome ~ .,
+                 data = training,
+                 method = 'glmnet',
+                 metric = 'ROC',
+                 trControl = train_control)
+
+# Results -----------------------------------------------------------------
+
+print(fit_glm$results)
+pred <- predict(fit_glm, newdata = testing[,-1])
+print(confusionMatrix(data = pred, testing$outcome, positive = "Sell"))
+
+varImp(fit_glm) %>% plot()
+varImp(fit_glm)
+
+```
+
+
+
+```{r}
+
+explainer <- lime(training[,-1], fit_glm)
+
+explanations <- lime::explain(testing[pred != testing$outcome,-1],
+                             explainer, n_labels = 1, n_features = 5)
+
+# explanations[, !(names(explanations) %in% c('model_type', 'model_intercept', 'data', 'feature_value'))]
+
+plot_features(explanations)
+
+```
+
+
+
+```{r rf}
+
+# Train model using cross-validation
+fit_rf <- train(form = outcome ~ .,
+             data = training,
+             method = 'rf',
+             metric = 'ROC',
+             trControl = train_control)
+
+# Results -----------------------------------------------------------------
+
+print(fit_rf$results)
+pred <- predict(fit_rf, newdata = testing)
+print(confusionMatrix(data = pred, testing$outcome, positive = "Sell"))
+
+varImp(fit_rf) %>% plot()
+
+```
+
+```{r}
+
+explainer <- lime(training[,-1], fit_rf)
+
+explanations <- lime::explain(testing[pred != testing$outcome,-1],
+                             explainer, n_labels = 1, n_features = 5)
+
+# explanations[, !(names(explanations) %in% c('model_type', 'model_intercept', 'data', 'feature_value'))]
+
+plot_features(explanations)
+
+```
+
+
+
+```{r gbm}
+
+# Train model using cross-validation
+fit_gbm <- train(form = outcome ~ .,
+             data = training,
+             method = 'gbm',
+             verbose = FALSE,
+             metric = 'ROC',
+             trControl = train_control)
+
+# Results -----------------------------------------------------------------
+
+print(fit_gbm$results)
+pred <- predict(fit_gbm, newdata = testing)
+print(confusionMatrix(data = pred, testing$outcome, positive = "Sell"))
+
+varImp(fit_gbm) %>% plot()
+
+```
+
+```{r}
+
+explainer <- lime(training[,-1], fit_gbm)
+
+explanations <- lime::explain(testing[pred != testing$outcome,-1],
+                             explainer, n_labels = 1, n_features = 5)
+
+# explanations[, !(names(explanations) %in% c('model_type', 'model_intercept', 'data', 'feature_value'))]
+
+plot_features(explanations)
+
+```
+
